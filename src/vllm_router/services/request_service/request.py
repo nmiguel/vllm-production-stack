@@ -853,3 +853,128 @@ async def route_general_transcriptions(
             status_code=500,
             content={"error": "Internal server error"},
         )
+
+
+async def route_image_edit_request(
+    request: Request,
+    endpoint: str,
+    background_tasks: BackgroundTasks,
+):
+    """Route OpenAI-compatible image edit requests (multipart/form-data)."""
+
+    request_id = request.headers.get("X-Request-Id", str(uuid.uuid4()))
+
+    # --- 1. Read raw body and extract model from content-type boundary ---
+    # Do NOT use await request.form() — just pass the raw bytes through.
+    body = await request.body()
+
+    # We still need the model name for routing. Parse just that from the raw body.
+    # Reuse the form parser minimally just for the model field.
+    try:
+        form = await request.form()
+        model = form.get("model")
+    except Exception:
+        return JSONResponse(
+            status_code=400,
+            content={"error": "Invalid multipart/form-data request"},
+            headers={"X-Request-Id": request_id},
+        )
+
+    if not model:
+        return JSONResponse(
+            status_code=400,
+            content={"error": "Invalid request: missing 'model' in form data."},
+            headers={"X-Request-Id": request_id},
+        )
+
+    # --- 2. Service discovery (same as before) ---
+    service_discovery = get_service_discovery()
+    router = request.app.state.router
+    engine_stats_scraper = request.app.state.engine_stats_scraper
+    request_stats_monitor = request.app.state.request_stats_monitor
+
+    endpoints = service_discovery.get_endpoint_info()
+    image_endpoints = [
+        ep for ep in endpoints if model in ep.model_names and not ep.sleep
+    ]
+
+    if not image_endpoints:
+        return JSONResponse(
+            status_code=404,
+            content={"error": f"No backend available for model {model}"},
+            headers={"X-Request-Id": request_id},
+        )
+
+    engine_stats = engine_stats_scraper.get_engine_stats()
+    request_stats = request_stats_monitor.get_request_stats(time.time())
+
+    server_url = router.route_request(
+        image_endpoints,
+        engine_stats,
+        request_stats,
+        request,
+    )
+
+    logger.info(
+        f"Routing image edit request {request_id} for model {model} to {server_url}"
+    )
+
+    # --- 3. Forward raw body directly — no re-parsing, no re-encoding ---
+    try:
+        client = request.app.state.aiohttp_client_wrapper()
+
+        # Forward headers as-is, preserving content-type with the original boundary
+        proxy_headers = {
+            k: v
+            for k, v in request.headers.items()
+            if k.lower() not in _HOP_BY_HOP_HEADERS
+        }
+        proxy_headers["X-Request-Id"] = request_id
+
+        backend_response = await client.post(
+            f"{server_url}{endpoint}",
+            data=body,  # raw bytes, untouched
+            headers=proxy_headers,  # includes original Content-Type + boundary
+            timeout=aiohttp.ClientTimeout(total=600),
+        )
+
+        response_content = await backend_response.json()
+
+        response_headers = {
+            k: v
+            for k, v in backend_response.headers.items()
+            if k.lower()
+            not in (
+                "content-length",
+                "content-encoding",
+                "transfer-encoding",
+                "connection",
+            )
+        }
+        response_headers["X-Request-Id"] = request_id
+
+        return JSONResponse(
+            content=response_content,
+            status_code=backend_response.status,
+            headers=response_headers,
+        )
+
+    except aiohttp.ClientResponseError as e:
+        return JSONResponse(
+            status_code=e.status,
+            content={"error": e.message},
+            headers={"X-Request-Id": request_id},
+        )
+    except aiohttp.ClientError as e:
+        return JSONResponse(
+            status_code=503,
+            content={"error": f"Backend connection failed: {str(e)}"},
+            headers={"X-Request-Id": request_id},
+        )
+    except Exception as e:
+        logger.error(e, exc_info=True)
+        return JSONResponse(
+            status_code=500,
+            content={"error": "Internal router error"},
+            headers={"X-Request-Id": request_id},
+        )
