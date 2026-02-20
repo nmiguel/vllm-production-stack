@@ -13,6 +13,7 @@
 # limitations under the License.
 
 # --- Request Processing & Routing ---
+import asyncio
 import json
 import os
 import time
@@ -20,11 +21,14 @@ import uuid
 from typing import Optional
 
 import aiohttp
+import websockets
 from fastapi import (
     BackgroundTasks,
     HTTPException,
     Request,
     UploadFile,
+    WebSocket,
+    WebSocketDisconnect,
 )
 from fastapi.responses import JSONResponse, StreamingResponse
 from requests import JSONDecodeError
@@ -978,3 +982,55 @@ async def route_image_edit_request(
             content={"error": "Internal router error"},
             headers={"X-Request-Id": request_id},
         )
+
+
+async def route_websocket_request(websocket: WebSocket, endpoint: str):
+    await websocket.accept()
+
+    request_id = websocket.headers.get("X-Request-Id") or str(uuid.uuid4())
+    start_time = time.time()
+
+    requested_model = websocket.query_params.get("model")
+    if not requested_model:
+        await websocket.close(code=1008)
+        return
+
+    service_discovery = get_service_discovery()
+    endpoints = [
+        e
+        for e in service_discovery.get_endpoint_info()
+        if requested_model in e.model_names and not e.sleep
+    ]
+
+    if not endpoints:
+        await websocket.close(code=1013)
+        return
+
+    router = websocket.app.state.router
+    server_url = router.route_request(endpoints, None, None, websocket)
+
+    backend_ws_url = server_url.replace("http", "ws") + endpoint
+
+    async with websockets.connect(
+        backend_ws_url,
+        extra_headers={"X-Request-Id": request_id},
+    ) as backend:
+
+        async def client_to_backend():
+            try:
+                while True:
+                    msg = await websocket.receive_text()
+                    await backend.send(msg)
+            except WebSocketDisconnect:
+                await backend.close()
+
+        async def backend_to_client():
+            async for msg in backend:
+                await websocket.send_text(msg)
+
+        await asyncio.gather(client_to_backend(), backend_to_client())
+
+    logger.info(
+        f"Realtime session {request_id} routed to {server_url} "
+        f"in {time.time() - start_time:.3f}s"
+    )

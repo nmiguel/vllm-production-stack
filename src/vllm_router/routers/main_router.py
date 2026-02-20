@@ -29,7 +29,10 @@ from vllm_router.services.request_service.request import (
     route_general_transcriptions,
     route_image_edit_request,
     route_sleep_wakeup_request,
+    route_websocket_request,
+    route_image_edit_request
 )
+# from websockets import WebSocket
 from vllm_router.stats.engine_stats import get_engine_stats_scraper
 from vllm_router.version import __version__
 
@@ -288,3 +291,8 @@ async def route_v1_images_edit(request: Request, background_tasks: BackgroundTas
 @main_router.post("/v1/messages")
 async def route_anthropic_messages(request: Request, background_tasks: BackgroundTasks):
     return await route_general_request(request, "/v1/messages", background_tasks)
+
+#
+# @main_router.websocket("/v1/realtime")
+# async def realtime_endpoint(ws: WebSocket):
+#     await route_websocket_request(ws, "/v1/realtime")
